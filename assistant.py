@@ -56,7 +56,7 @@ SCREEN_RING_SIZE = 5
 HISTORY_SIZE = 5
 AUDIO_RING_SECONDS = 30         # размер ring buffer для ручного триггера
 
-WHISPER_MODEL_SIZE = "small"
+WHISPER_MODEL_SIZE = "large-v3-turbo"
 WHISPER_PROMPT = (
     "Junior DS, Data Science, Python, tuple, list, dict, set, frozen set, "
     "MLOps, ML System Design, Mock Interview, "
@@ -558,6 +558,245 @@ def get_context() -> str:
 # Выполняем первоначальную загрузку при старте — чтобы SYSTEM_PROMPT сформировался правильно
 _INIT_CONTEXT = get_context()
 
+
+# --- Проектные заметки (RAG-lite по локальным .md/.txt) ---
+# Папка notes/ рядом с утилитой: рекурсивно читаем .md и .txt, режем на чанки,
+# строим TF-IDF на numpy и подмешиваем до 3 релевантных чанков в вопрос.
+# Индекс строится лениво при первом вопросе; пересборка — при изменении mtime файлов.
+NOTES_DIR = Path(__file__).parent / "notes"
+NOTES_CHUNK_CHARS = 500
+NOTES_TOP_K = 3
+NOTES_MIN_SCORE = 0.12
+NOTES_MAX_CHARS = 1800
+_NOTES_TOKEN_RE = re.compile(r"[а-яёa-z0-9_]{3,}")
+
+_notes_lock = threading.Lock()
+_notes_index: dict = {"signature": None, "chunks": [], "vocab": {}, "idf": None, "matrix": None}
+_notes_memo_lock = threading.Lock()
+_notes_memo: dict = {"query": None, "signature": None, "block": "", "labels": []}
+
+
+def _notes_files() -> list:
+    """Все .md/.txt рекурсивно в notes/. Пустой список, если папки нет."""
+    if not NOTES_DIR.is_dir():
+        return []
+    try:
+        return [
+            p for p in sorted(NOTES_DIR.rglob("*"))
+            if p.is_file() and p.suffix.lower() in (".md", ".txt")
+        ]
+    except OSError as e:
+        print(f"[notes] scan error: {e}", flush=True)
+        return []
+
+
+def _notes_signature(files: list) -> tuple:
+    """Отпечаток набора файлов: путь + mtime. Новый файл или правка меняют отпечаток."""
+    sig = []
+    for p in files:
+        try:
+            sig.append((str(p), p.stat().st_mtime))
+        except OSError:
+            pass
+    return tuple(sig)
+
+
+def _split_notes_text(text: str, limit: int = NOTES_CHUNK_CHARS) -> list:
+    """Режет текст на чанки ~limit символов, границы — заголовки и пустые строки."""
+    blocks = re.split(r"\n\s*\n|\n(?=#)", text)
+    chunks, cur = [], ""
+    for block in blocks:
+        block = block.strip()
+        while len(block) > limit:
+            cut = block.rfind(" ", 0, limit)
+            if cut <= 0:
+                cut = limit
+            head, block = block[:cut].strip(), block[cut:].strip()
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            if head:
+                chunks.append(head)
+        if not block:
+            continue
+        if cur and len(cur) + len(block) + 2 > limit:
+            chunks.append(cur)
+            cur = block
+        elif cur:
+            cur = f"{cur}\n\n{block}"
+        else:
+            cur = block
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def _notes_title(chunk: str) -> str:
+    """Заголовок чанка — первые 40 символов текста в одну строку."""
+    title = " ".join(chunk.split())
+    return title[:40] + ("…" if len(title) > 40 else "")
+
+
+def _notes_tokens(text: str) -> list:
+    return _NOTES_TOKEN_RE.findall(text.lower())
+
+
+def _build_notes_index(files: list) -> None:
+    """Пересобирает TF-IDF индекс по всем файлам заметок (вызывается под локом)."""
+    docs, labels = [], []
+    for p in files:
+        try:
+            raw = p.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            print(f"[notes] read error {p.name}: {e}", flush=True)
+            continue
+        try:
+            rel = p.relative_to(NOTES_DIR).as_posix()
+        except ValueError:
+            rel = p.name
+        for chunk in _split_notes_text(raw):
+            docs.append(chunk)
+            labels.append(rel)
+
+    vocab: dict = {}
+    token_counts = []
+    for chunk in docs:
+        counts: dict = {}
+        for token in _notes_tokens(chunk):
+            counts[token] = counts.get(token, 0) + 1
+        token_counts.append(counts)
+        for token in counts:
+            if token not in vocab:
+                vocab[token] = len(vocab)
+
+    n = len(docs)
+    df = np.zeros(len(vocab), dtype=np.float64)
+    for counts in token_counts:
+        for token in counts:
+            df[vocab[token]] += 1.0
+    idf = np.log((n + 1.0) / (df + 1.0)) + 1.0
+
+    matrix = np.zeros((n, len(vocab)), dtype=np.float32)
+    for i, counts in enumerate(token_counts):
+        for token, cnt in counts.items():
+            matrix[i, vocab[token]] = cnt * idf[vocab[token]]
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    norms[norms == 0.0] = 1.0
+    matrix /= norms
+
+    chunks = [
+        {"label": labels[i], "title": _notes_title(docs[i]), "text": docs[i], "vector": matrix[i]}
+        for i in range(n)
+    ]
+    _notes_index.update(
+        signature=_notes_signature(files), chunks=chunks, vocab=vocab, idf=idf, matrix=matrix,
+    )
+    print(f"[notes] index built: {len(files)} files, {n} chunks", flush=True)
+
+
+def _clear_notes_memo() -> None:
+    """Сбрасывает мемо поиска: после смены индекса старые labels/block невалидны."""
+    with _notes_memo_lock:
+        _notes_memo.update(query=None, signature=None, block="", labels=[])
+
+
+def _ensure_notes_index() -> bool:
+    """Пересобирает индекс при изменении набора файлов/mtime. False — заметок нет."""
+    files = _notes_files()
+    if not files:
+        with _notes_lock:
+            _notes_index.update(signature=None, chunks=[], vocab={}, idf=None, matrix=None)
+        _clear_notes_memo()
+        return False
+    signature = _notes_signature(files)
+    if signature != _notes_index["signature"]:
+        with _notes_lock:
+            # double-check под блокировкой (другой поток мог уже пересобрать)
+            if signature != _notes_index["signature"]:
+                _build_notes_index(files)
+        _clear_notes_memo()
+    return True
+
+
+def search_notes(query: str) -> dict:
+    """
+    Ищет до NOTES_TOP_K релевантных чанков заметок по косинусу TF-IDF.
+    Возвращает {"block": текст для промпта, "labels": [файлы]}.
+    Пустой block, если заметок нет или ничего не прошло порог NOTES_MIN_SCORE.
+    """
+    empty = {"block": "", "labels": []}
+    if not query or not query.strip():
+        return empty
+    # Подпись текущего набора заметок — часть ключа мемо: удаление/правка файлов
+    # инвалидирует кэш ещё до обращения к индексу.
+    signature = _notes_signature(_notes_files())
+    with _notes_memo_lock:
+        if _notes_memo["query"] == query and _notes_memo["signature"] == signature:
+            return {"block": _notes_memo["block"], "labels": list(_notes_memo["labels"])}
+
+    if not _ensure_notes_index():
+        return empty
+    with _notes_lock:
+        chunks = list(_notes_index["chunks"])
+        vocab = dict(_notes_index["vocab"])
+        idf = _notes_index["idf"]
+        matrix = _notes_index["matrix"]
+    if not chunks or not vocab or idf is None or matrix is None or not len(matrix):
+        return empty
+
+    counts: dict = {}
+    for token in _notes_tokens(query):
+        j = vocab.get(token)
+        if j is not None:
+            counts[j] = counts.get(j, 0) + 1
+    if not counts:
+        return empty
+    qvec = np.zeros(len(vocab), dtype=np.float32)
+    for j, cnt in counts.items():
+        qvec[j] = cnt * idf[j]
+    qnorm = float(np.linalg.norm(qvec))
+    if qnorm == 0.0:
+        return empty
+    qvec /= qnorm
+
+    scores = matrix @ qvec
+    order = np.argsort(scores)[::-1]
+    picked, total = [], 0
+    for idx in order:
+        if len(picked) >= NOTES_TOP_K:
+            break
+        score = float(scores[idx])
+        if score < NOTES_MIN_SCORE:
+            break
+        chunk = chunks[int(idx)]
+        piece = chunk["text"]
+        if total + len(piece) > NOTES_MAX_CHARS:
+            allowed = NOTES_MAX_CHARS - total
+            if allowed <= 0:
+                break
+            piece = piece[:allowed]
+            # Режем по границе слова, если она есть в пределах allowed
+            cut = piece.rfind(" ")
+            if cut > 0:
+                piece = piece[:cut]
+        picked.append((chunk, score, piece))
+        total += len(piece)
+        if total >= NOTES_MAX_CHARS:
+            break
+
+    if not picked:
+        block, labels = "", []
+    else:
+        lines = ["Выдержки из проектных заметок (могут быть неполными; при противоречии верь вопросу):"]
+        for chunk, _score, piece in picked:
+            lines.append(f"[notes/{chunk['label']} › {chunk['title']}] {piece}")
+        block = "\n".join(lines)
+        labels = list(dict.fromkeys(chunk["label"] for chunk, _s, _t in picked))
+    with _notes_memo_lock:
+        _notes_memo.update(query=query, signature=signature, block=block, labels=labels)
+    return {"block": block, "labels": labels}
+
+
 _SYSTEM_PROMPT_BASE = (
     "Ты помощник пользователю на техническом собеседовании. "
     "Слышишь голос интервьюера через системный звук и можешь получать скриншот экрана пользователя, "
@@ -767,6 +1006,10 @@ def _build_local_question(
             "Скриншот НЕ передан — не описывай содержимое экрана, "
             "пиши 'Экран: не передан'.\n\n"
         )
+    # Подмешиваем релевантные выдержки из notes/ (поиск по TF-IDF, без анализа моделью)
+    notes = search_notes(transcript)
+    if notes["block"]:
+        text += notes["block"] + "\n\n"
     return text + "Ответь по инструкции из system prompt."
 
 
@@ -1654,8 +1897,16 @@ def on_segment(audio: np.ndarray):
             overlay.set_quick_status_safe("Слушаю...")
             return
 
-        overlay.set_quick_status_safe("Спрашиваю...")
-        overlay.set_deep_status_safe("Спрашиваю...")
+        # Какие заметки подтянулись — показываем в статусе слота.
+        # Только для локальных агентов: в режиме vps заметки в запрос не попадают,
+        # поэтому индекс не строим и статус не обещаем.
+        _notes_hint = ""
+        if _agent_mode() != "vps":
+            _notes_hit = search_notes(transcript)
+            if _notes_hit["labels"]:
+                _notes_hint = f" (заметки: {', '.join(_notes_hit['labels'])})"
+        overlay.set_quick_status_safe(f"Спрашиваю...{_notes_hint}")
+        overlay.set_deep_status_safe(f"Спрашиваю...{_notes_hint}")
 
         # Сохраняем транскрипт для возможного retry через F9 mode B/C
         global last_transcript
