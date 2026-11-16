@@ -75,6 +75,17 @@ SCREEN_RING_SIZE = 5
 HISTORY_SIZE = 5
 AUDIO_RING_SECONDS = 30         # размер ring buffer для ручного триггера
 
+# --- Спекулятивные черновики (промежуточная речь) ---
+SPEC_INTERVAL_SECONDS = 1.2      # не чаще одного черновика на сегмент
+SPEC_MIN_SEGMENT_SECONDS = 0.4   # короче — Whisper гонять бессмысленно
+SPEC_MIN_CHARS = 8               # слишком короткий черновик не показываем
+SPEC_SIMILARITY_THRESHOLD = 0.8  # доля общих слов >= порога => текст не изменился
+QUICK_MIN_INTERVAL_SECONDS = 1.0  # суммарный лимит запросов в быстрый слот
+# Лимиты ответа: черновику хватает короткого фрагмента (~1.5-2 с), финалу нужен
+# полный формат «Экран/Вопрос/3-4 буллета» — на 140 токенах он обрезался.
+SPEC_DRAFT_MAX_TOKENS = 70
+QUICK_FINAL_MAX_TOKENS = 400
+
 WHISPER_MODEL_SIZE = "large-v3-turbo"
 WHISPER_PROMPT = (
     "Junior DS, Data Science, Python, tuple, list, dict, set, frozen set, "
@@ -323,6 +334,15 @@ class AgentCallError(RuntimeError):
     """
 
 
+class SpecCancelled(Exception):
+    """Черновик отменён финальным запросом.
+
+    Намеренно НЕ наследник AgentCallError: иначе ask_slot принял бы отмену за
+    сбой агента и ушёл бы в fallback VPS, породив лишний запрос. _run_draft
+    гасит это исключение молча.
+    """
+
+
 def _ask_cli(spec: dict, prompt: str, timeout: int, image_path: str | None = None) -> str:
     """Вызов CLI-харнесса через stdin. Текст ответа при успехе, иначе AgentCallError."""
     name = spec.get("name") or "cli"
@@ -375,10 +395,14 @@ def _ask_cli(spec: dict, prompt: str, timeout: int, image_path: str | None = Non
 def _ask_deepseek(
     spec: dict, prompt: str, timeout: int, image_path: str | None = None,
     on_delta=None, slot: str | None = None,
+    max_tokens_override: int | None = None, cancel_event=None,
 ) -> str:
     """Прямой HTTP-запрос к api.deepseek.com со стримингом (SSE).
     Возвращает полный текст ответа; on_delta(accumulated) зовётся по мере поступления дельт.
-    slot — имя слота (quick/deep/third): от него зависит дефолтный лимит ответа."""
+    slot — имя слота (quick/deep/third): от него зависит дефолтный лимит ответа.
+    max_tokens_override — лимит ответа в обход конфига (черновики).
+    cancel_event (threading.Event) — отмена в полёте: как только он взведён,
+    чтение потока прерывается, соединение закрывается, поднимается SpecCancelled."""
     name = spec.get("name") or "deepseek"
     key_env = spec.get("api_key_env") or "DEEPSEEK_API_KEY"
     api_key = (spec.get("api_key") or _env(key_env)).strip().strip("\r\n")
@@ -388,9 +412,9 @@ def _ask_deepseek(
     model = spec.get("model") or DEEPSEEK_DEFAULT_MODEL
     api_url = spec.get("api_url") or DEEPSEEK_API_URL
     # Лимит ответа: явный max_tokens из agents.json применяется к любому слоту.
-    # Если он не задан — дефолт 140 токенов только для быстрого слота (quick);
+    # Если он не задан — дефолт QUICK_FINAL_MAX_TOKENS для быстрого слота (quick);
     # deep/third без явного лимита ограничение не отправляют, иначе глубокий
-    # ответ обрезается.
+    # ответ обрезается. max_tokens_override (черновик) сильнее всего остального.
     max_tokens: int | None = None
     raw_max_tokens = spec.get("max_tokens")
     if raw_max_tokens is not None:
@@ -405,7 +429,9 @@ def _ask_deepseek(
                 print(f"[{name}] max_tokens={max_tokens} должен быть > 0 — лимит не отправляем", flush=True)
                 max_tokens = None
     elif slot == "quick":
-        max_tokens = 140
+        max_tokens = QUICK_FINAL_MAX_TOKENS
+    if max_tokens_override is not None and max_tokens_override > 0:
+        max_tokens = max_tokens_override
     # Свежий скриншот уходит в формате OpenAI vision (data:image/jpeg;base64,...)
     if image_path and Path(image_path).exists():
         b64 = base64.b64encode(Path(image_path).read_bytes()).decode()
@@ -432,6 +458,9 @@ def _ask_deepseek(
 
     chunks: list[str] = []
     finish_reason = None
+    # Отменённый до отправки черновик не должен занимать сеть и квоту.
+    if cancel_event is not None and cancel_event.is_set():
+        raise SpecCancelled("черновик отменён до отправки")
     # Общий дедлайн на весь стрим: read-таймаут httpx сбрасывается на каждом
     # чанке, поэтому «сочащийся» поток иначе держал бы вызов бесконечно.
     deadline = time.monotonic() + timeout
@@ -444,6 +473,10 @@ def _ask_deepseek(
     ) as resp:
         resp.raise_for_status()
         for line in resp.iter_lines():
+            # Отмена черновика финалом: выходим из чтения, контекст-менеджер
+            # закроет соединение — поток не досчитывается до конца.
+            if cancel_event is not None and cancel_event.is_set():
+                raise SpecCancelled("черновик отменён в полёте")
             if time.monotonic() > deadline:
                 raise AgentCallError(f"Ошибка {name}: timeout {timeout}s")
             line = (line or "").strip()
@@ -507,6 +540,7 @@ def _ask_deepseek(
 def ask_local(
     agent, system_prompt: str, question: str, timeout: int = 60,
     image_path: str | None = None, on_delta=None, slot: str | None = None,
+    max_tokens_override: int | None = None, cancel_event=None,
 ) -> str:
     """
     Вызов указанного в agents.json агента. Возвращает текст ответа,
@@ -523,11 +557,16 @@ def ask_local(
     agent_type = str(spec.get("type") or "cli").lower()
     try:
         if agent_type == "deepseek":
-            return _ask_deepseek(spec, prompt, timeout, image_path=image_path, on_delta=on_delta, slot=slot)
+            return _ask_deepseek(
+                spec, prompt, timeout, image_path=image_path, on_delta=on_delta, slot=slot,
+                max_tokens_override=max_tokens_override, cancel_event=cancel_event,
+            )
         if agent_type == "cli":
             return _ask_cli(spec, prompt, timeout, image_path=image_path)
         raise AgentCallError(f"Ошибка {name}: неизвестный тип агента '{agent_type}'")
     except AgentCallError:
+        raise
+    except SpecCancelled:
         raise
     except subprocess.TimeoutExpired:
         raise AgentCallError(f"Ошибка {name}: timeout {timeout}s")
@@ -603,6 +642,10 @@ else:
 
 # --- Флаг LLM-фильтра: True = фильтровать ответы кандидата (тестовый режим), False = prod ---
 FILTER_QUESTIONS = os.environ.get("TEST_FILTER_QUESTIONS", "0") == "1"
+
+# --- Флаг спекулятивных черновиков: по умолчанию выключены (на замерах давали
+# 4.7 с против 3.2 с у финального ответа). Включить: MVP_SPEC=1 ---
+SPEC_ENABLED = os.environ.get("MVP_SPEC", "0") == "1"
 
 # --- Ключ Gemini для локального is_interviewer_question ---
 GEMINI_API_KEY = _env("GEMINI_API_KEY", "")
@@ -1138,11 +1181,14 @@ def _ask_vps_slot(slot: str, transcript: str, screens: list[str], session_id: st
         raise AgentCallError(f"{type(e).__name__}: {_safe_error(e)}")
 
 
-def ask_slot(slot: str, transcript: str, screens: list[str], session_id: str, on_delta=None) -> tuple[str, int]:
+def ask_slot(slot: str, transcript: str, screens: list[str], session_id: str, on_delta=None,
+             max_tokens_override: int | None = None, cancel_event=None) -> tuple[str, int]:
     """
     Роутинг слота overlay: vps | local | local_fallback_vps.
     Возвращает (answer, latency_ms). Ошибка вызова — AgentCallError.
     on_delta — необязательный колбэк для стриминга локального deepseek-агента.
+    max_tokens_override / cancel_event — только для локального deepseek-слота
+    (черновики); в режиме vps они не применимы и игнорируются.
     """
     mode = _agent_mode()
     agent = _slot_agents().get(slot)
@@ -1186,6 +1232,8 @@ def ask_slot(slot: str, transcript: str, screens: list[str], session_id: str, on
             image_path=image_path,
             on_delta=on_delta,
             slot=slot,
+            max_tokens_override=max_tokens_override,
+            cancel_event=cancel_event,
         )
     except AgentCallError as e:
         if mode == "local_fallback_vps":
@@ -1326,6 +1374,88 @@ def _log_exchange(
 _quick_in_flight = False
 _quick_in_flight_lock = threading.Lock()
 
+# Лимит «не более одного запроса в быстрый слот в секунду» (финальные + черновые).
+# Финальный запрос ждёт освобождения слота, черновой — просто пропускается.
+_quick_rate_lock = threading.Lock()
+_last_quick_request_ts = 0.0
+
+_WORD_RE = re.compile(r"[a-zа-яё0-9]+", re.IGNORECASE)
+
+
+def _normalize_words(text: str) -> list[str]:
+    """Слова в нижнем регистре без пунктуации — для сравнения черновиков."""
+    return _WORD_RE.findall((text or "").lower())
+
+
+def _word_overlap(a: list[str], b: list[str]) -> float:
+    """Доля общих уникальных слов относительно более длинного набора (0..1)."""
+    sa, sb = set(a), set(b)
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / max(len(sa), len(sb))
+
+
+def _quick_rate_acquire(blocking: bool) -> bool:
+    """Занимает быстрый слот. blocking=True (финал) — ждёт, False (черновик) — skip."""
+    global _last_quick_request_ts
+    with _quick_rate_lock:
+        now = time.monotonic()
+        wait = QUICK_MIN_INTERVAL_SECONDS - (now - _last_quick_request_ts)
+        if wait > 0:
+            if not blocking:
+                return False
+        else:
+            wait = 0.0
+        # Резервируем момент отправки заранее — иначе два потока одновременно
+        # решат, что слот свободен.
+        _last_quick_request_ts = now + wait
+    if wait > 0:
+        time.sleep(wait)
+    return True
+
+
+def _quick_rate_preempt() -> None:
+    """Снимает резерв интервала, занятый отменённым черновиком.
+
+    Финал не должен ждать секунду из-за черновика, который мы только что
+    прервали: слот освобождается сразу.
+    """
+    global _last_quick_request_ts
+    with _quick_rate_lock:
+        _last_quick_request_ts = 0.0
+
+
+def _log_spec_first(spec_first_ms: int, draft: str) -> None:
+    """Метрика spec_first_ms: от старта речи до первого чернового текста."""
+    record = {
+        "ts": datetime.utcnow().isoformat() + "Z",
+        "event": "spec_first",
+        "spec_first_ms": spec_first_ms,
+        "draft": draft,
+    }
+    try:
+        with CLIENT_LOG.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"[LOG] spec write error: {e}")
+    print(f"[spec] first draft after {spec_first_ms}ms: {draft[:60]}", flush=True)
+
+
+def _log_spec_cancelled(draft_ms: int, draft: str) -> None:
+    """Метрика spec_cancelled: черновик прерван финальным запросом."""
+    record = {
+        "ts": datetime.utcnow().isoformat() + "Z",
+        "event": "spec_cancelled",
+        "draft_ms": draft_ms,
+        "draft": draft[:200],
+    }
+    try:
+        with CLIENT_LOG.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"[LOG] spec write error: {e}")
+    print(f"[spec] spec_cancelled after {draft_ms}ms: {draft[:60]}", flush=True)
+
 
 def ask_dual(transcript: str, screens: list[str], session_id: str, whisper_latency_ms: int | None = None,
              segment_end_ts: float | None = None) -> None:
@@ -1337,6 +1467,12 @@ def ask_dual(transcript: str, screens: list[str], session_id: str, whisper_laten
     whisper_latency_ms — время транскрипции Whisper, пишется только в quick-запись.
     segment_end_ts — time.monotonic() момента завершения VAD-сегмента (для метрики end_to_first_ms).
     """
+    # Единая точка инвалидации черновиков: любой финальный путь (обычный сегмент,
+    # F9 retry, screen-only) отменяет спекулятивные поколения. Иначе черновик,
+    # ушедший в полёт до финала, допишется поверх реального ответа.
+    if speculator is not None:
+        speculator.on_final()
+
     global _quick_in_flight
     seg_end = segment_end_ts if segment_end_ts is not None else time.monotonic()
 
@@ -1368,6 +1504,9 @@ def ask_dual(transcript: str, screens: list[str], session_id: str, whisper_laten
                 return
             _quick_in_flight = True
         try:
+            # Финальный запрос приоритетнее черновиков: ждёт свободный слот,
+            # а не отбрасывается лимитом.
+            _quick_rate_acquire(blocking=True)
             answer, quick_ms = ask_slot("quick", transcript, screens, session_id, on_delta=_on_delta)
             overlay.append_quick_qa_safe(transcript, answer, quick_ms)
             overlay.set_quick_status_safe(f"Ответ ({quick_ms}ms)")
@@ -1388,10 +1527,11 @@ def ask_dual(transcript: str, screens: list[str], session_id: str, whisper_laten
                 _quick_in_flight = False
 
     def _deep_thread():
+        label = _slot_label("deep", "Deep")
         try:
             overlay.set_deep_status_safe("Думаю глубоко...")
             answer, latency_ms = ask_slot("deep", transcript, screens, session_id)
-            overlay.append_deep_qa_safe(transcript, answer, latency_ms)
+            overlay.append_deep_qa_safe(transcript, answer, latency_ms, label=label)
             overlay.set_deep_status_safe(f"Ответ ({latency_ms}ms)")
             # Пишем запись только для deep — quick уже записан отдельно
             _log_exchange(transcript, None, answer, None, latency_ms)
@@ -1400,6 +1540,7 @@ def ask_dual(transcript: str, screens: list[str], session_id: str, whisper_laten
             overlay.set_deep_status_safe(f"Ошибка: {_safe_error(e)}")
 
     def _third_thread():
+        label = _slot_label("third", "Claude")
         # Guard строим от того, куда реально уйдёт запрос: THIRD_ENGINE управляет
         # только VPS-путём, локальный агент слота от него не зависит.
         # Это лишь ранний пропуск: настоящий gate стоит в ask_third, поэтому
@@ -1413,7 +1554,7 @@ def ask_dual(transcript: str, screens: list[str], session_id: str, whisper_laten
         try:
             overlay.set_third_status_safe("Думает...")
             answer, latency_ms = ask_slot("third", transcript, screens, session_id)
-            overlay.append_third_qa_safe(transcript, answer, latency_ms)
+            overlay.append_third_qa_safe(transcript, answer, latency_ms, label=label)
             overlay.set_third_status_safe(f"Ответ ({latency_ms}ms)")
             _log_exchange(transcript, None, None, None, None, third=answer, third_ms=latency_ms)
         except Exception as e:
@@ -1566,6 +1707,9 @@ class VadWatcher:
         _preroll_frames = max(1, -(-VAD_PREROLL_MS // VAD_FRAME_MS))
         self._preroll: deque = deque(maxlen=_preroll_frames)
         self._last_sent = 0.0
+        # Для спекулятивных черновиков: номер текущего сегмента и момент начала речи
+        self._segment_seq = 0
+        self._speech_start_ts = 0.0
         self._rate_lock = threading.Lock()
         # Счётчики для debug-вывода каждые 3 сек
         self._dbg_voiced = 0
@@ -1595,9 +1739,13 @@ class VadWatcher:
 
             if is_speech:
                 # Перед первым voiced-кадром добираем pre-roll из последних тихих кадров
-                if not self._segment and self._preroll:
-                    self._segment.extend(self._preroll)
-                    self._preroll.clear()
+                if not self._segment:
+                    # Новый сегмент: фиксируем номер и старт речи для черновиков
+                    self._segment_seq += 1
+                    self._speech_start_ts = time.monotonic()
+                    if self._preroll:
+                        self._segment.extend(self._preroll)
+                        self._preroll.clear()
                 self._segment.append(frame_np)
                 self._silence_count = 0
                 # Force-flush по максимальной длине — не ждать паузы от интервьюера
@@ -1659,6 +1807,16 @@ class VadWatcher:
         overlay.set_quick_status_safe("Слушаю...")
         self._on_segment(segment_audio)
 
+    def spec_snapshot(self):
+        """Снимок накопленного сегмента для спекулятивной транскрипции.
+
+        Копия списка делается без блокировки: feed() только добавляет фреймы и
+        пересоздаёт список при flush, поэтому копия всегда целостна по кадрам.
+        Возвращает (frames, speech_start_ts, segment_seq, is_recording).
+        """
+        frames = list(self._segment)
+        return frames, self._speech_start_ts, self._segment_seq, bool(frames)
+
     def reset_rate_limit(self) -> None:
         """Сбрасывает rate-limit timestamp. Используется ручным триггером."""
         now = time.time()
@@ -1669,6 +1827,206 @@ class VadWatcher:
     def is_recording(self) -> bool:
         """True если VAD сейчас накапливает речевой сегмент."""
         return len(self._segment) > 0
+
+
+# --- Спекулятивные черновики ---
+
+# Whisper один на процесс: финальная и черновая транскрипции не должны идти
+# одновременно (faster-whisper на CUDA не потокобезопасен).
+_whisper_lock = threading.Lock()
+
+
+class SpeculativeEngine:
+    """
+    Пока VAD копит речь, раз в SPEC_INTERVAL_SECONDS транскрибирует накопленный
+    сегмент и, если текст существенно изменился, отправляет черновик в быстрый слот.
+
+    Отмена поколений: каждый новый черновик инкрементирует _gen. Результат
+    запроса применяется только если его поколение всё ещё текущее. Финальный
+    сегмент (on_final) тоже инкрементирует _gen — все черновики «в полёте»
+    становятся устаревшими, процесс не убиваем, результат просто игнорируется.
+
+    Ограничения: не более одного чернового запроса в полёте и общий лимит
+    быстрого слота QUICK_MIN_INTERVAL_SECONDS (см. _quick_rate_acquire).
+    Приоритет финала: on_final отменяет черновик в полёте (см. _cancel),
+    освобождает резерв интервала и не ждёт его завершения.
+    """
+
+    def __init__(self, vad, whisper_getter, ask_quick, show_draft, clear_draft, log_metric):
+        self._vad = vad
+        self._get_whisper = whisper_getter
+        self._ask_quick = ask_quick
+        self._show_draft = show_draft
+        self._clear_draft = clear_draft
+        self._log_metric = log_metric
+        self._gen = 0
+        self._gen_lock = threading.Lock()
+        self._in_flight = False
+        self._in_flight_lock = threading.Lock()
+        # Отмена черновика в полёте: взводится финалом, читается в цикле SSE.
+        self._cancel = threading.Event()
+        self._draft_text = ""
+        self._draft_started = 0.0
+        self._last_run = 0.0
+        self._last_words: list[str] = []
+        self._seen_seq = -1
+        self._speech_start = None
+        self._metric_logged = False
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+
+    # --- поколения ---
+
+    def current_gen(self) -> int:
+        with self._gen_lock:
+            return self._gen
+
+    def _next_gen(self) -> int:
+        with self._gen_lock:
+            self._gen += 1
+            return self._gen
+
+    def on_final(self) -> None:
+        """Финальный сегмент: черновики этого сегмента больше не применяются.
+
+        Черновик в полёте прерывается (его HTTP-поток закрывается), а резерв
+        интервала в быстром слоте снимается — финал не ждёт отменённый черновик.
+        """
+        self._next_gen()
+        self._last_words = []
+        cancelled = False
+        with self._in_flight_lock:
+            if self._in_flight and not self._cancel.is_set():
+                self._cancel.set()
+                cancelled = True
+                draft_text = self._draft_text
+                draft_ms = int((time.monotonic() - self._draft_started) * 1000) if self._draft_started else 0
+        if cancelled:
+            _quick_rate_preempt()
+            _log_spec_cancelled(draft_ms, draft_text)
+        try:
+            self._clear_draft()
+        except Exception as e:
+            print(f"[spec] clear error: {e}", flush=True)
+
+    # --- поток ---
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        # Дождаться выхода потока: не убиваем его посреди CUDA-транскрипции.
+        # is_alive() ложен и для незапущенного потока — join() тогда не зовём.
+        if self._thread.is_alive():
+            self._thread.join(timeout=2.5)
+            if self._thread.is_alive():
+                print("[spec] поток не завершился за 2.5s", flush=True)
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            self._stop.wait(0.2)
+            try:
+                self._tick()
+            except Exception as e:
+                print(f"[spec] error: {type(e).__name__}: {str(e)[:150]}", flush=True)
+
+    def _transcribe(self, audio_float) -> str:
+        model = self._get_whisper()
+        if model is None:
+            return ""
+        with _whisper_lock:
+            segments, _ = model.transcribe(
+                audio_float,
+                language="ru",
+                beam_size=1,
+                initial_prompt=WHISPER_PROMPT,
+                condition_on_previous_text=False,
+                temperature=0,
+            )
+            return " ".join(seg.text.strip() for seg in segments).strip()
+
+    def _tick(self) -> None:
+        if self._get_whisper() is None:
+            return
+        frames, speech_start, seq, recording = self._vad.spec_snapshot()
+        if not recording or not frames:
+            return
+        if seq != self._seen_seq:
+            # Новый сегмент — сбрасываем историю сравнения и метрику
+            self._seen_seq = seq
+            self._last_words = []
+            self._speech_start = speech_start
+            self._metric_logged = False
+        duration = sum(len(f) for f in frames) / SAMPLE_RATE
+        if duration < SPEC_MIN_SEGMENT_SECONDS:
+            return
+        now = time.monotonic()
+        if now - self._last_run < SPEC_INTERVAL_SECONDS:
+            return
+        self._last_run = now
+
+        audio = np.concatenate(frames).astype(np.float32) / 32768.0
+        text = self._transcribe(audio)
+        if not text or len(text) < SPEC_MIN_CHARS or _is_junk_transcript(text):
+            return
+        words = _normalize_words(text)
+        if self._last_words and _word_overlap(words, self._last_words) >= SPEC_SIMILARITY_THRESHOLD:
+            return  # текст не изменился существенно — повторный запрос не нужен
+
+        with self._in_flight_lock:
+            # Пока черновик в полёте, новый не запускаем и текущий не отменяем:
+            # его результат — самый свежий из готовых. Следующий тик возьмёт
+            # уточнённый текст, когда слот освободится.
+            if self._in_flight:
+                print("[spec] skip launch: предыдущий черновик ещё в полёте", flush=True)
+                return
+            if not _quick_rate_acquire(blocking=False):
+                print("[spec] skip launch: лимит 1 запрос/с в быстрый слот", flush=True)
+                return
+            self._in_flight = True
+            # Предыдущий черновик теперь устарел — его результат проигнорируется
+            gen = self._next_gen()
+            # Новый (или уже закрытый финалом) флаг отмены для этого черновика
+            self._cancel = threading.Event()
+            cancel = self._cancel
+            self._draft_text = text
+            self._draft_started = time.monotonic()
+        self._last_words = words
+        threading.Thread(target=self._run_draft, args=(gen, text, cancel), daemon=True).start()
+
+    def _run_draft(self, gen: int, text: str, cancel: threading.Event) -> None:
+        try:
+            def _on_delta(acc: str) -> None:
+                if not acc.strip() or self.current_gen() != gen:
+                    return
+                self._log_metric_once(gen, text)
+                self._show_draft(gen, acc)
+
+            answer, _ms = self._ask_quick(text, _on_delta, cancel)
+            # Результат применяем только если поколение не сменилось финалом
+            # или более новым черновиком.
+            if self.current_gen() == gen and answer.strip():
+                self._log_metric_once(gen, text)
+                self._show_draft(gen, answer)
+        except SpecCancelled:
+            # Отменён финалом — это штатный сценарий, не ошибка.
+            pass
+        except Exception as e:
+            print(f"[spec] draft error: {type(e).__name__}: {str(e)[:150]}", flush=True)
+        finally:
+            with self._in_flight_lock:
+                self._in_flight = False
+
+    def _log_metric_once(self, gen: int, text: str) -> None:
+        if self._metric_logged or self._speech_start is None:
+            return
+        self._metric_logged = True
+        self._log_metric(int((time.monotonic() - self._speech_start) * 1000), text)
+
+
+# Единственный экземпляр создаётся после старта VAD (см. низ файла)
+speculator: "SpeculativeEngine | None" = None
 
 
 # --- Screenshot ring ---
@@ -2028,15 +2386,16 @@ def on_segment(audio: np.ndarray):
 
         audio_float = audio.astype(np.float32) / 32768.0
         t_ws_start = time.time()
-        segments, _ = whisper_model.transcribe(
-            audio_float,
-            language="ru",
-            beam_size=1,
-            initial_prompt=WHISPER_PROMPT,
-            condition_on_previous_text=False,
-            temperature=0,
-        )
-        transcript = " ".join(seg.text.strip() for seg in segments).strip()
+        with _whisper_lock:
+            segments, _ = whisper_model.transcribe(
+                audio_float,
+                language="ru",
+                beam_size=1,
+                initial_prompt=WHISPER_PROMPT,
+                condition_on_previous_text=False,
+                temperature=0,
+            )
+            transcript = " ".join(seg.text.strip() for seg in segments).strip()
         whisper_latency_ms = int((time.time() - t_ws_start) * 1000)
 
         if not transcript:
@@ -2182,11 +2541,23 @@ def manual_trigger():
 
 class DualOverlay:
     """
-    Одно полупрозрачное окно без рамки с тремя вертикальными зонами:
-    слева, по центру и справа — по одному агенту в каждой.
+    Одно полупрозрачное окно без рамки: сверху крупным шрифтом быстрый ответ
+    (живой стрим), ниже — блок «Глубокий разбор», куда по мере готовности
+    дописываются ответы фоновых агентов (codex/cursor).
+    Всё это один текстовый виджет с прокруткой; высота окна фиксирована.
     """
 
-    def __init__(self, width: int = 2000, height: int = 450, position_y: int = 30):
+    _QUICK_FONT = ("Segoe UI", 15)
+    _DEEP_FONT = ("Segoe UI", 10)
+    _META_FONT = ("Segoe UI", 9)
+    _SECTION_FONT = ("Segoe UI", 11, "bold")
+    _STREAM_HEADER = "\n── поток ──\n"
+    _DRAFT_HEADER = "\n── предварительно ──\n"
+    _DEEP_HEADING = "Глубокий разбор"
+    _SEPARATOR = "─" * 60 + "\n"
+    _WELCOME = "VAD слушает. F9 — ручной триггер | F8 — sticky скрин.\n"
+
+    def __init__(self, width_ratio: float = 0.70, height_ratio: float = 0.40, position_y: int = 30):
         self.root = tk.Tk()
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
@@ -2194,11 +2565,20 @@ class DualOverlay:
         self.root.configure(bg="#1e1e1e")
 
         sw = self.root.winfo_screenwidth()
-        width = min(width, sw - 20)  # clamp k shirine ekrana
+        sh = self.root.winfo_screenheight()
+        width = max(600, min(int(sw * width_ratio), sw - 20))
+        height = max(240, min(int(sh * height_ratio), sh - 60))
         x = max(0, (sw - width) // 2)
         self.root.geometry(f"{width}x{height}+{x}+{position_y}")
 
-        # Header (drag-handle) — содержит title и кнопку закрытия
+        # Состояние отображения (до создания виджетов: их refresh-методы его читают)
+        self._title = "Interview Assistant v0.6.0"
+        self._quick_status = ""
+        self._f_status_text = "[F9: READY]  [F8: STICKY OFF]"
+        self._agent_status: dict = {}
+        self._stream_start = None
+
+        # Header — заголовок и ручка перетаскивания, кнопок нет
         header_frame = tk.Frame(self.root, bg="#2a2a2a")
         header_frame.pack(fill="x", side="top")
 
@@ -2215,111 +2595,43 @@ class DualOverlay:
         self._header.bind("<ButtonPress-1>", self._on_drag_start)
         self._header.bind("<B1-Motion>", self._on_drag_motion)
 
-        # Кнопка закрытия — завершает весь процесс
-        self._btn_close = tk.Label(
-            header_frame,
-            text="✕",
-            font=("Segoe UI", 14, "bold"),
-            fg="white", bg="#2a2a2a",
-            cursor="hand2",
-            padx=10,
-        )
-        self._btn_close.pack(side="right")
-        self._btn_close.bind("<ButtonPress-1>", lambda e: self._close_app())
-        self._btn_close.bind("<Enter>", lambda e: self._btn_close.config(fg="red", bg="#a00000"))
-        self._btn_close.bind("<Leave>", lambda e: self._btn_close.config(fg="white", bg="#2a2a2a"))
+        # Esc только скрывает панель, процесс продолжает работать
+        self.root.bind("<Escape>", lambda e: self.hide())
 
-        self.root.bind("<Escape>", lambda e: self._close_app())
-
-        # Body container: две вертикальные зоны
+        # Единое тело: один текстовый виджет с прокруткой.
+        # Быстрый ответ — крупным шрифтом вверху, «Глубокий разбор» — ниже
+        # разделителя мелким шрифтом. Порядок записей — по времени завершения.
         body_frame = tk.Frame(self.root, bg="#1e1e1e")
         body_frame.pack(fill="both", expand=True)
 
-        # Левая зона (первый слот)
-        left = tk.Frame(body_frame, bg="#1e1e1e")
-        left.pack(side="left", fill="both", expand=True, padx=(10, 5), pady=10)
-
-        self._quick_title = tk.Label(
-            left, text=f"{_slot_label('quick', 'Gemini Flash-Lite')}",
-            font=("Segoe UI", 11, "bold"),
-            fg="#88ccff", bg="#1e1e1e", anchor="w",
-        )
-        self._quick_title.pack(fill="x")
-
-        self._quick_body = scrolledtext.ScrolledText(
-            left,
+        self._body = scrolledtext.ScrolledText(
+            body_frame,
             font=("Segoe UI", 12),
             fg="white", bg="#1e1e1e",
             wrap="word",
             width=1,
             borderwidth=0, highlightthickness=0,
         )
-        self._quick_body.pack(fill="both", expand=True)
+        self._body.pack(fill="both", expand=True, padx=10, pady=8)
+        self._body.tag_configure("quick", font=self._QUICK_FONT, foreground="white", spacing3=2)
+        self._body.tag_configure("deep", font=self._DEEP_FONT, foreground="#e0e0e0", spacing3=3)
+        self._body.tag_configure("stream", font=self._QUICK_FONT, foreground="#cfe8ff")
+        self._body.tag_configure("meta", font=self._META_FONT, foreground="#9aa4b0")
+        self._body.tag_configure("section", font=self._SECTION_FONT, foreground="#ffcc88", spacing1=4)
+        self._body.tag_configure("sep", font=self._META_FONT, foreground="#555555")
         # Readonly: запрещаем редактирование, но разрешаем выделение и Ctrl+C
-        self._quick_body.bind("<Key>", lambda e: "break")
-        self._quick_body.bind("<<Paste>>", lambda e: "break")
-        self._quick_body.bind("<<Cut>>", lambda e: "break")
-        self._quick_body.bind("<Control-c>", lambda e: None)
-        self._quick_body.bind("<Control-C>", lambda e: None)
+        self._body.bind("<Key>", lambda e: "break")
+        self._body.bind("<<Paste>>", lambda e: "break")
+        self._body.bind("<<Cut>>", lambda e: "break")
+        self._body.bind("<Control-c>", lambda e: None)
+        self._body.bind("<Control-C>", lambda e: None)
 
-        # Центральная зона (второй слот)
-        right = tk.Frame(body_frame, bg="#1e1e1e")
-        right.pack(side="left", fill="both", expand=True, padx=(5, 5), pady=10)
+        self._init_layout()
 
-        self._deep_title = tk.Label(
-            right, text=f"{_slot_label('deep', 'Gemini Flash')}",
-            font=("Segoe UI", 11, "bold"),
-            fg="#ffcc88", bg="#1e1e1e", anchor="w",
-        )
-        self._deep_title.pack(fill="x")
-
-        self._deep_body = scrolledtext.ScrolledText(
-            right,
-            font=("Segoe UI", 12),
-            fg="white", bg="#1e1e1e",
-            wrap="word",
-            width=1,
-            borderwidth=0, highlightthickness=0,
-        )
-        self._deep_body.pack(fill="both", expand=True)
-        # Readonly: запрещаем редактирование, но разрешаем выделение и Ctrl+C
-        self._deep_body.bind("<Key>", lambda e: "break")
-        self._deep_body.bind("<<Paste>>", lambda e: "break")
-        self._deep_body.bind("<<Cut>>", lambda e: "break")
-        self._deep_body.bind("<Control-c>", lambda e: None)
-        self._deep_body.bind("<Control-C>", lambda e: None)
-
-        # Правая зона (третий слот)
-        third = tk.Frame(body_frame, bg="#1e1e1e")
-        third.pack(side="left", fill="both", expand=True, padx=(5, 10), pady=10)
-
-        self._third_title = tk.Label(
-            third, text=f"{_slot_label('third', 'Claude')}",
-            font=("Segoe UI", 11, "bold"),
-            fg="#aaffaa", bg="#1e1e1e", anchor="w",
-        )
-        self._third_title.pack(fill="x")
-
-        self._third_body = scrolledtext.ScrolledText(
-            third,
-            font=("Segoe UI", 12),
-            fg="white", bg="#1e1e1e",
-            wrap="word",
-            width=1,
-            borderwidth=0, highlightthickness=0,
-        )
-        self._third_body.pack(fill="both", expand=True)
-        # Readonly: запрещаем редактирование, но разрешаем выделение и Ctrl+C
-        self._third_body.bind("<Key>", lambda e: "break")
-        self._third_body.bind("<<Paste>>", lambda e: "break")
-        self._third_body.bind("<<Cut>>", lambda e: "break")
-        self._third_body.bind("<Control-c>", lambda e: None)
-        self._third_body.bind("<Control-C>", lambda e: None)
-
-        # Строка состояния F8/F9 (под панелями ответов, поверх footer)
+        # Строка состояния F8/F9 и фоновых агентов (под телом)
         self._f_status = tk.Label(
             self.root,
-            text="[F9: READY]  [F8: STICKY OFF]",
+            text=self._f_status_text,
             font=("Segoe UI", 10),
             fg="#aaaaaa", bg="#2a2a2a",
             anchor="w",
@@ -2327,19 +2639,18 @@ class DualOverlay:
         )
         self._f_status.pack(fill="x", side="bottom")
 
-        # Приветственная строка — отображается до первого вопроса
-        welcome = "VAD слушает. F9 — ручной триггер | F8 — sticky скрин.\n"
-        self._quick_body.insert("1.0", welcome)
-        self._deep_body.insert("1.0", welcome)
-        self._third_body.insert("1.0", welcome)
-
         self._visible = True
         self._drag_start_x = 0
         self._drag_start_y = 0
-        # Позиция живого блока стриминга в тексте первого слота (None — блока нет)
-        self._quick_stream_index = None
-        # Позиция текста стрима (сразу после строки заголовка)
-        self._quick_stream_body_index = None
+
+    def _init_layout(self) -> None:
+        """Начальная разметка единого текста: welcome, быстрый блок, разделитель, разбор."""
+        # quick_end — точка вставки быстрых ответов (перед разделителем и разбором)
+        self._body.insert("end", self._WELCOME, "meta")
+        self._body.mark_set("quick_end", "end-1c")
+        self._body.mark_gravity("quick_end", "right")
+        self._body.insert("end", self._SEPARATOR, "sep")
+        self._body.insert("end", self._DEEP_HEADING + "\n", "section")
 
     def _on_drag_start(self, event):
         self._drag_start_x = event.x
@@ -2351,60 +2662,74 @@ class DualOverlay:
         self.root.geometry(f"+{x}+{y}")
 
     def set_header(self, text: str) -> None:
-        self._header.config(text=text)
+        self._title = text
+        self._refresh_header()
 
     def set_quick_status(self, text: str) -> None:
-        self._quick_title.config(
-            text=f"{_slot_label('quick', 'Gemini')}  |  {text}"
-        )
+        self._quick_status = text
+        self._refresh_header()
 
-    def set_deep_status(self, text: str) -> None:
-        self._deep_title.config(
-            text=f"{_slot_label('deep', 'Gemini Flash')}  |  {text}"
-        )
+    def _refresh_header(self) -> None:
+        text = self._title
+        if self._quick_status:
+            text = f"{text}  |  {self._quick_status}"
+        self._header.config(text=text)
 
-    # Заголовок живого блока стриминга в панели первого слота
-    _QUICK_STREAM_HEADER = "\n── поток ──\n"
+    def _auto_scroll(self, target: str) -> None:
+        """Автоскролл только если пользователь не отлистал текст вручную."""
+        try:
+            _first, last = self._body.yview()
+        except Exception as e:
+            print(f"[overlay] yview error: {type(e).__name__}: {e}", flush=True)
+            return
+        # Скроллим только когда пользователь стоит у нижней границы.
+        # Отлистал вверх (в том числе в самый верх) — не дёргаем.
+        if last >= 0.999:
+            self._body.see(target)
 
-    def _set_quick_stream_inner(self, text: str) -> None:
-        """Живой предпросмотр стриминга в тексте панели первого слота."""
-        if self._quick_stream_index is None:
-            # Индекс начала блока запоминаем ДО вставки заголовка: очистка
-            # должна удалять и заголовок, и текст стрима, а не оставлять хвост.
-            self._quick_stream_index = self._quick_body.index("end-1c")
-            self._quick_body.insert("end", self._QUICK_STREAM_HEADER)
-            # Начало текста берём ПОСЛЕ вставки заголовка: арифметика
-            # «индекс + len(header)» промахивалась на один символ, и текст
-            # рисовался в одной строке с «── поток ──».
-            self._quick_stream_body_index = self._quick_body.index("end-1c")
-        body_start = self._quick_stream_body_index
-        self._quick_body.delete(body_start, "end-1c")
-        self._quick_body.insert(body_start, text)
-        self._quick_body.see("end")
+    def _set_quick_stream_inner(self, text: str, preliminary: bool = False) -> None:
+        """Живой предпросмотр быстрого ответа в верхней части панели.
+
+        preliminary=True — черновой (спекулятивный) текст, помечается «предварительно».
+        """
+        if self._stream_start is None:
+            self._body.mark_set("stream_start", "quick_end")
+            self._body.mark_gravity("stream_start", "left")
+            self._stream_start = "stream_start"
+        # Полная замена блока: старый черновик не должен накапливаться
+        self._body.delete(self._stream_start, "quick_end")
+        header = self._DRAFT_HEADER if preliminary else self._STREAM_HEADER
+        self._body.insert("quick_end", header, "meta")
+        self._body.insert("quick_end", text, "stream")
+        self._auto_scroll("quick_end")
 
     def _clear_quick_stream_inner(self) -> None:
-        """Убирает живой блок стриминга вместе с заголовком."""
-        if self._quick_stream_index is not None:
-            self._quick_body.delete(self._quick_stream_index, "end-1c")
-            self._quick_stream_index = None
-            self._quick_stream_body_index = None
+        """Убирает живой блок стрима вместе с заголовком."""
+        if self._stream_start is not None:
+            self._body.delete(self._stream_start, "quick_end")
+            self._body.mark_unset(self._stream_start)
+            self._stream_start = None
 
     def _append_quick_qa_inner(self, transcript: str, answer: str, latency_ms=None) -> None:
         self._clear_quick_stream_inner()
-        from datetime import datetime
         ts = datetime.now().strftime("%H:%M:%S")
         lat_str = f" ({latency_ms}ms)" if latency_ms else ""
-        entry = f"\n─── {ts}{lat_str} ────\n❓ {transcript}\n─\n{answer}\n"
-        self._quick_body.insert("end", entry)
-        self._quick_body.see("end")
+        if transcript:
+            self._body.insert("quick_end", f"\n❓ {transcript}\n", "meta")
+        self._body.insert("quick_end", f"— {ts}{lat_str}\n", "meta")
+        self._body.insert("quick_end", f"{answer}\n", "quick")
+        self._auto_scroll("quick_end")
 
-    def _append_deep_qa_inner(self, transcript: str, answer: str, latency_ms=None) -> None:
-        from datetime import datetime
+    def _append_deep_qa_inner(self, transcript: str, answer: str, latency_ms=None, label: str = "") -> None:
+        """Ответ фонового агента дописывается в блок «Глубокий разбор»."""
         ts = datetime.now().strftime("%H:%M:%S")
         lat_str = f" ({latency_ms}ms)" if latency_ms else ""
-        entry = f"\n─── {ts}{lat_str} ────\n❓ {transcript}\n─\n{answer}\n"
-        self._deep_body.insert("end", entry)
-        self._deep_body.see("end")
+        name = label or _slot_label("deep", "Deep")
+        self._body.insert("end", f"\n[{name} {ts}{lat_str}]\n", "meta")
+        if transcript:
+            self._body.insert("end", f"❓ {transcript}\n", "meta")
+        self._body.insert("end", f"{answer}\n", "deep")
+        self._auto_scroll("end")
 
     def show(self) -> None:
         self._visible = True
@@ -2415,14 +2740,6 @@ class DualOverlay:
     def hide(self) -> None:
         self._visible = False
         self.root.withdraw()
-
-    def _close_app(self) -> None:
-        """Корректно закрывает overlay и завершает весь Python-процесс."""
-        try:
-            self.root.destroy()
-        except Exception:
-            pass
-        os._exit(0)
 
     def toggle_visible(self) -> None:
         if self._visible:
@@ -2436,8 +2753,8 @@ class DualOverlay:
     def set_quick_status_safe(self, text: str) -> None:
         self.root.after(0, lambda: self.set_quick_status(text))
 
-    def set_quick_stream_safe(self, text: str) -> None:
-        self.root.after(0, lambda: self._set_quick_stream_inner(text))
+    def set_quick_stream_safe(self, text: str, preliminary: bool = False) -> None:
+        self.root.after(0, lambda: self._set_quick_stream_inner(text, preliminary))
 
     def clear_quick_stream_safe(self) -> None:
         self.root.after(0, self._clear_quick_stream_inner)
@@ -2448,33 +2765,55 @@ class DualOverlay:
     def append_quick_qa_safe(self, transcript: str, answer: str, latency_ms=None) -> None:
         self.root.after(0, lambda: self._append_quick_qa_inner(transcript, answer, latency_ms))
 
-    def append_deep_qa_safe(self, transcript: str, answer: str, latency_ms=None) -> None:
-        self.root.after(0, lambda: self._append_deep_qa_inner(transcript, answer, latency_ms))
+    def append_deep_qa_safe(self, transcript: str, answer: str, latency_ms=None, label: str = "") -> None:
+        self.root.after(0, lambda: self._append_deep_qa_inner(transcript, answer, latency_ms, label))
+
+    def set_deep_status(self, text: str) -> None:
+        # Статус фонового агента — в нижней строке, чтобы не занимать место в панели
+        self._agent_status["deep"] = text
+        self._refresh_footer()
 
     def set_third_status(self, text: str) -> None:
-        self._third_title.config(
-            text=f"{_slot_label('third', 'Claude')}  |  {text}"
-        )
+        self._agent_status["third"] = text
+        self._refresh_footer()
 
-    def _append_third_qa_inner(self, transcript: str, answer: str, latency_ms=None) -> None:
-        from datetime import datetime
-        ts = datetime.now().strftime("%H:%M:%S")
-        lat_str = f" ({latency_ms}ms)" if latency_ms else ""
-        entry = f"\n─── {ts}{lat_str} ────\n❓ {transcript}\n─\n{answer}\n"
-        self._third_body.insert("end", entry)
-        self._third_body.see("end")
+    def _append_third_qa_inner(self, transcript: str, answer: str, latency_ms=None, label: str = "") -> None:
+        # Третий слот пишет в тот же блок «Глубокий разбор», со своей подписью
+        self._append_deep_qa_inner(transcript, answer, latency_ms, label or _slot_label("third", "Third"))
 
     def set_third_status_safe(self, text: str) -> None:
         self.root.after(0, lambda: self.set_third_status(text))
 
-    def append_third_qa_safe(self, transcript: str, answer: str, latency_ms=None) -> None:
-        self.root.after(0, lambda: self._append_third_qa_inner(transcript, answer, latency_ms))
+    def append_third_qa_safe(self, transcript: str, answer: str, latency_ms=None, label: str = "") -> None:
+        self.root.after(0, lambda: self._append_third_qa_inner(transcript, answer, latency_ms, label))
 
     def show_safe(self) -> None:
         self.root.after(0, self.show)
 
+    def _clear_all_inner(self) -> None:
+        """Полная очистка панели с восстановлением разметки."""
+        self._body.delete("1.0", "end")
+        if self._stream_start is not None:
+            self._body.mark_unset(self._stream_start)
+            self._stream_start = None
+        # Сбрасываем статусы, иначе заголовок/футер показывают состояние старого запроса
+        self._quick_status = ""
+        self._agent_status.clear()
+        self._refresh_header()
+        self._refresh_footer()
+        self._init_layout()
+
     def set_f_status(self, text: str) -> None:
-        self._f_status.config(text=text)
+        self._f_status_text = text
+        self._refresh_footer()
+
+    def _refresh_footer(self) -> None:
+        parts = [self._f_status_text]
+        for slot in ("deep", "third"):
+            status = self._agent_status.get(slot)
+            if status:
+                parts.append(f"{_slot_label(slot, slot.capitalize())}: {status}")
+        self._f_status.config(text="  |  ".join(parts))
 
     def set_f_status_safe(self, text: str) -> None:
         self.root.after(0, lambda: self.set_f_status(text))
@@ -2482,6 +2821,30 @@ class DualOverlay:
 
 # Единственный экземпляр окна
 overlay = DualOverlay()
+
+
+def _show_draft_safe(gen: int, text: str) -> None:
+    """Черновик попадает в панель, только если его поколение всё ещё текущее.
+
+    Проверка повторяется на главном потоке Tk: финальный ответ мог обогнать
+    уже поставленный в очередь after(0).
+    """
+    def _apply() -> None:
+        if speculator is not None and speculator.current_gen() == gen:
+            overlay._set_quick_stream_inner(text, preliminary=True)
+    overlay.root.after(0, _apply)
+
+
+def _ask_quick_draft(text: str, on_delta, cancel_event=None) -> tuple[str, int]:
+    """Черновой запрос в быстрый слот: без скриншотов, стрим — через on_delta.
+
+    Лимит ответа короче (SPEC_DRAFT_MAX_TOKENS), чтобы черновик укладывался
+    в ~1.5-2 с; cancel_event позволяет финалу прервать поток.
+    """
+    return ask_slot(
+        "quick", text, [], SESSION_ID, on_delta=on_delta,
+        max_tokens_override=SPEC_DRAFT_MAX_TOKENS, cancel_event=cancel_event,
+    )
 
 
 # --- HTTP control server ---
@@ -2558,14 +2921,7 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
             overlay.root.after(0, overlay.hide)
             self._json(200, {"status": "hidden"})
         elif path == "/clear":
-            def _clear():
-                overlay._quick_body.delete("1.0", "end")
-                overlay._deep_body.delete("1.0", "end")
-                # Сбрасываем индекс живого блока: текстовое поле очищено,
-                # старый индекс указывает в пустоту.
-                overlay._quick_stream_index = None
-                overlay._quick_stream_body_index = None
-            overlay.root.after(0, _clear)
+            overlay.root.after(0, overlay._clear_all_inner)
             self._json(200, {"status": "cleared"})
         elif path == "/invalidate_context":
             # Принудительный сброс кэша context.md — следующий get_context() перечитает файл
@@ -2662,6 +3018,20 @@ recorder = LoopbackRecorder()
 vad_watcher = VadWatcher(on_segment=on_segment)
 recorder.register_callback(vad_watcher.feed)
 
+# Спекулятивные черновики: чёрный ход в быстрый слот, пока VAD копит речь.
+# Запускается после VAD, чтобы on_segment мог инвалидировать поколения.
+# По умолчанию выключены (SPEC_ENABLED=False): поток не создаётся, speculator = None.
+if SPEC_ENABLED:
+    speculator = SpeculativeEngine(
+        vad=vad_watcher,
+        whisper_getter=lambda: whisper_model,
+        ask_quick=_ask_quick_draft,
+        show_draft=_show_draft_safe,
+        clear_draft=overlay.clear_quick_stream_safe,
+        log_metric=_log_spec_first,
+    )
+    speculator.start()
+
 
 def _toggle_overlay():
     overlay.root.after(0, overlay.toggle_visible)
@@ -2709,5 +3079,7 @@ print(f"  Лог: {CLIENT_LOG}")
 try:
     overlay.root.mainloop()
 finally:
+    if speculator is not None:
+        speculator.stop()
     hotkeys.stop()
     recorder.close()
