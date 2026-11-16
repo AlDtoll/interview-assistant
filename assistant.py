@@ -82,7 +82,7 @@ if F9_MODE not in {"A", "B", "C", "D"}:
     print(f"[f9] Неизвестный F9_MODE='{F9_MODE}', сброс в 'C'", flush=True)
     F9_MODE = "C"
 
-# Эндпоинт Deep — задаётся через env (DEEP_ENDPOINT), встроенного дефолта нет
+# Эндпоинт второго слота — задаётся через env (DEEP_ENDPOINT), встроенного дефолта нет
 DEEP_ENDPOINT = os.environ.get("DEEP_ENDPOINT", "")
 # Токен только из окружения: встроенный дефолт не держим, без переменной VPS-режим
 # даёт явную ошибку (см. _vps_headers).
@@ -730,7 +730,7 @@ def _agent_mode() -> str:
 
 
 def _slot_agents() -> dict:
-    """Слоты overlay → описания агентов (1-й Quick, 2-й Deep, 3-й Third)."""
+    """Слоты overlay → описания агентов (1-й, 2-й, 3-й слот)."""
     with _agents_lock:
         selected = list(AGENT_CONFIG.get("selected") or [])
     return {
@@ -971,9 +971,9 @@ _quick_in_flight_lock = threading.Lock()
 
 def ask_dual(transcript: str, screens: list[str], session_id: str, whisper_latency_ms: int | None = None) -> None:
     """
-    Запускает два параллельных запроса (Quick + Deep), каждый обновляет свой overlay.
+    Запускает два параллельных запроса (первый и второй слоты), каждый обновляет свой overlay.
     Блокироваться не нужно — оба потока daemon, результаты через after(0, ...).
-    Quick пропускается (skip), если предыдущий запрос ещё не завершился — защита от throttling.
+    Первый слот пропускается (skip), если предыдущий запрос ещё не завершился — защита от throttling.
     Лог пишется раздельно: каждый тир пишет свою JSONL-запись сразу по завершении (null для другого).
     whisper_latency_ms — время транскрипции Whisper, пишется только в quick-запись.
     """
@@ -990,19 +990,19 @@ def ask_dual(transcript: str, screens: list[str], session_id: str, whisper_laten
         with _quick_in_flight_lock:
             if _quick_in_flight:
                 print("[quick] skipped: предыдущий запрос ещё в процессе")
-                overlay.set_quick_status_safe("Quick: пропуск (занят)")
+                overlay.set_quick_status_safe("пропуск (занят)")
                 return
             _quick_in_flight = True
         try:
             answer, quick_ms = ask_slot("quick", transcript, screens, session_id)
             overlay.append_quick_qa_safe(transcript, answer, quick_ms)
-            overlay.set_quick_status_safe(f"Ответ Quick ({quick_ms}ms)")
+            overlay.set_quick_status_safe(f"Ответ ({quick_ms}ms)")
             # Пишем запись только для quick — deep ещё может быть в процессе
             # whisper_latency_ms пишем в quick-запись (transcript первичен здесь)
             _log_exchange(transcript, answer, None, quick_ms, None, whisper_latency_ms=whisper_latency_ms)
         except Exception as e:
             print(f"[quick] error: {type(e).__name__}: {str(e)[:200]}", flush=True)
-            overlay.set_quick_status_safe(f"Ошибка Quick: {_safe_error(e)}")
+            overlay.set_quick_status_safe(f"Ошибка: {_safe_error(e)}")
         finally:
             with _quick_in_flight_lock:
                 _quick_in_flight = False
@@ -1012,12 +1012,12 @@ def ask_dual(transcript: str, screens: list[str], session_id: str, whisper_laten
             overlay.set_deep_status_safe("Думаю глубоко...")
             answer, latency_ms = ask_slot("deep", transcript, screens, session_id)
             overlay.append_deep_qa_safe(transcript, answer, latency_ms)
-            overlay.set_deep_status_safe(f"Ответ Deep ({latency_ms}ms)")
+            overlay.set_deep_status_safe(f"Ответ ({latency_ms}ms)")
             # Пишем запись только для deep — quick уже записан отдельно
             _log_exchange(transcript, None, answer, None, latency_ms)
         except Exception as e:
             print(f"[deep] error: {type(e).__name__}: {str(e)[:200]}", flush=True)
-            overlay.set_deep_status_safe(f"Ошибка Deep: {_safe_error(e)}")
+            overlay.set_deep_status_safe(f"Ошибка: {_safe_error(e)}")
 
     def _third_thread():
         # Guard строим от того, куда реально уйдёт запрос: THIRD_ENGINE управляет
@@ -1030,16 +1030,15 @@ def ask_dual(transcript: str, screens: list[str], session_id: str, whisper_laten
         if will_use_vps and THIRD_ENGINE == "off":
             print("[third] пропуск: запрос ушёл бы на VPS, а THIRD_ENGINE=off", flush=True)
             return
-        third_label = _slot_label("third", "Claude")
         try:
-            overlay.set_third_status_safe(f"Думает {third_label}...")
+            overlay.set_third_status_safe("Думает...")
             answer, latency_ms = ask_slot("third", transcript, screens, session_id)
             overlay.append_third_qa_safe(transcript, answer, latency_ms)
-            overlay.set_third_status_safe(f"{third_label} ({latency_ms}ms)")
+            overlay.set_third_status_safe(f"Ответ ({latency_ms}ms)")
             _log_exchange(transcript, None, None, None, None, third=answer, third_ms=latency_ms)
         except Exception as e:
             print(f"[third] error: {type(e).__name__}: {str(e)[:200]}", flush=True)
-            overlay.set_third_status_safe(f"Ошибка {third_label}: {_safe_error(e)}")
+            overlay.set_third_status_safe(f"Ошибка: {_safe_error(e)}")
 
     threading.Thread(target=_quick_thread, daemon=True).start()
     threading.Thread(target=_deep_thread, daemon=True).start()
@@ -1655,7 +1654,7 @@ def on_segment(audio: np.ndarray):
             overlay.set_quick_status_safe("Слушаю...")
             return
 
-        overlay.set_quick_status_safe(f"Спрашиваю {_slot_label('quick', 'Gemini')}...")
+        overlay.set_quick_status_safe("Спрашиваю...")
         overlay.set_deep_status_safe("Спрашиваю...")
 
         # Сохраняем транскрипт для возможного retry через F9 mode B/C
@@ -1770,8 +1769,8 @@ def manual_trigger():
 
 class DualOverlay:
     """
-    Одно полупрозрачное окно без рамки с двумя вертикальными зонами:
-    слева — Quick (Gemini), справа — Deep (Gemini Flash).
+    Одно полупрозрачное окно без рамки с тремя вертикальными зонами:
+    слева, по центру и справа — по одному агенту в каждой.
     """
 
     def __init__(self, width: int = 2000, height: int = 450, position_y: int = 30):
@@ -1823,12 +1822,12 @@ class DualOverlay:
         body_frame = tk.Frame(self.root, bg="#1e1e1e")
         body_frame.pack(fill="both", expand=True)
 
-        # Левая зона (Quick — Gemini)
+        # Левая зона (первый слот)
         left = tk.Frame(body_frame, bg="#1e1e1e")
         left.pack(side="left", fill="both", expand=True, padx=(10, 5), pady=10)
 
         self._quick_title = tk.Label(
-            left, text=f"Quick — {_slot_label('quick', 'Gemini Flash-Lite')}",
+            left, text=f"{_slot_label('quick', 'Gemini Flash-Lite')}",
             font=("Segoe UI", 11, "bold"),
             fg="#88ccff", bg="#1e1e1e", anchor="w",
         )
@@ -1850,12 +1849,12 @@ class DualOverlay:
         self._quick_body.bind("<Control-c>", lambda e: None)
         self._quick_body.bind("<Control-C>", lambda e: None)
 
-        # Центральная зона (Deep — Gemini Flash)
+        # Центральная зона (второй слот)
         right = tk.Frame(body_frame, bg="#1e1e1e")
         right.pack(side="left", fill="both", expand=True, padx=(5, 5), pady=10)
 
         self._deep_title = tk.Label(
-            right, text=f"Deep — {_slot_label('deep', 'Gemini Flash')}",
+            right, text=f"{_slot_label('deep', 'Gemini Flash')}",
             font=("Segoe UI", 11, "bold"),
             fg="#ffcc88", bg="#1e1e1e", anchor="w",
         )
@@ -1877,12 +1876,12 @@ class DualOverlay:
         self._deep_body.bind("<Control-c>", lambda e: None)
         self._deep_body.bind("<Control-C>", lambda e: None)
 
-        # Правая зона (Third — Claude Sonnet)
+        # Правая зона (третий слот)
         third = tk.Frame(body_frame, bg="#1e1e1e")
         third.pack(side="left", fill="both", expand=True, padx=(5, 10), pady=10)
 
         self._third_title = tk.Label(
-            third, text=f"{_slot_label('third', 'Claude')} — Альтернативный взгляд",
+            third, text=f"{_slot_label('third', 'Claude')}",
             font=("Segoe UI", 11, "bold"),
             fg="#aaffaa", bg="#1e1e1e", anchor="w",
         )
@@ -1904,7 +1903,7 @@ class DualOverlay:
         self._third_body.bind("<Control-c>", lambda e: None)
         self._third_body.bind("<Control-C>", lambda e: None)
 
-        # Строка состояния F8/F9 (под Quick/Deep/Claude блоками, поверх footer)
+        # Строка состояния F8/F9 (под панелями ответов, поверх footer)
         self._f_status = tk.Label(
             self.root,
             text="[F9: READY]  [F8: STICKY OFF]",
@@ -1939,12 +1938,12 @@ class DualOverlay:
 
     def set_quick_status(self, text: str) -> None:
         self._quick_title.config(
-            text=f"Quick — {_slot_label('quick', 'Gemini')}  |  {text}"
+            text=f"{_slot_label('quick', 'Gemini')}  |  {text}"
         )
 
     def set_deep_status(self, text: str) -> None:
         self._deep_title.config(
-            text=f"Deep — {_slot_label('deep', 'Gemini Flash')}  |  {text}"
+            text=f"{_slot_label('deep', 'Gemini Flash')}  |  {text}"
         )
 
     def _append_quick_qa_inner(self, transcript: str, answer: str, latency_ms=None) -> None:
@@ -2004,7 +2003,7 @@ class DualOverlay:
 
     def set_third_status(self, text: str) -> None:
         self._third_title.config(
-            text=f"Third — {_slot_label('third', 'Claude')}  |  {text}"
+            text=f"{_slot_label('third', 'Claude')}  |  {text}"
         )
 
     def _append_third_qa_inner(self, transcript: str, answer: str, latency_ms=None) -> None:
@@ -2241,8 +2240,8 @@ hotkeys.start()
 print(f"Assistant v0.6.0 running. Session: {SESSION_ID}")
 print(f"  Системный звук: WASAPI loopback")
 print(f"  VAD: aggressiveness={VAD_AGGRESSIVENESS}, пауза {SILENCE_FRAMES_THRESHOLD * VAD_FRAME_MS / 1000:.1f}s -> отправка")
-print(f"  Три слота: Quick={_slot_label('quick', 'Gemini Flash-Lite')} | "
-      f"Deep={_slot_label('deep', 'Gemini Flash')} | Third={_slot_label('third', 'Claude')} "
+print(f"  Три слота: 1={_slot_label('quick', 'Gemini Flash-Lite')} | "
+      f"2={_slot_label('deep', 'Gemini Flash')} | 3={_slot_label('third', 'Claude')} "
       f"(mode={_agent_mode()})")
 print(f"  Deep endpoint: {DEEP_ENDPOINT}")
 print(f"  Control API: http://0.0.0.0:{CONTROL_PORT}  (token saved to .agent_token)")
