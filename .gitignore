@@ -1,0 +1,32 @@
+# Секреты и личные данные — никогда не коммитить
+secrets.env
+.env
+agents.json
+context.md
+.agent_token
+
+# Логи и захваченные медиа
+interview_logs/
+*.wav
+*.jpg
+*.jpeg
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+venv/
+.venv/
+env/
+.pytest_cache/
+.mypy_cache/
+
+# Бэкапы
+*.bak
+*.bak-*
+*.bak_*
+
+# Прочее
+.DS_Store
+*.log
