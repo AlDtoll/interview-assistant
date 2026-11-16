@@ -685,7 +685,7 @@ def _build_notes_index(files: list) -> None:
     matrix /= norms
 
     chunks = [
-        {"label": labels[i], "title": _notes_title(docs[i]), "text": docs[i], "vector": matrix[i]}
+        {"label": labels[i], "title": _notes_title(docs[i]), "text": docs[i]}
         for i in range(n)
     ]
     _notes_index.update(
@@ -1901,12 +1901,17 @@ def on_segment(audio: np.ndarray):
         # Только для локальных агентов: в режиме vps заметки в запрос не попадают,
         # поэтому индекс не строим и статус не обещаем.
         _notes_hint = ""
-        if _agent_mode() != "vps":
+        _mode = _agent_mode()
+        if _mode != "vps":
             _notes_hit = search_notes(transcript)
             if _notes_hit["labels"]:
                 _notes_hint = f" (заметки: {', '.join(_notes_hit['labels'])})"
-        overlay.set_quick_status_safe(f"Спрашиваю...{_notes_hint}")
-        overlay.set_deep_status_safe(f"Спрашиваю...{_notes_hint}")
+        # В local_fallback_vps слот без локального агента уходит на VPS — заметки туда не попадают
+        _slots = _slot_agents()
+        _quick_hint = _notes_hint if _mode != "vps" and _slots.get("quick") is not None else ""
+        _deep_hint = _notes_hint if _mode != "vps" and _slots.get("deep") is not None else ""
+        overlay.set_quick_status_safe(f"Спрашиваю...{_quick_hint}")
+        overlay.set_deep_status_safe(f"Спрашиваю...{_deep_hint}")
 
         # Сохраняем транскрипт для возможного retry через F9 mode B/C
         global last_transcript

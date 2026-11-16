@@ -34,7 +34,7 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-Первый запуск скачает модель Whisper (~150 МБ для `base`, больше для `small`).
+Первый запуск скачает модель Whisper (`large-v3-turbo`, около 1.5 ГБ); модель меняется константой `WHISPER_MODEL_SIZE`.
 
 ## Настройка
 
