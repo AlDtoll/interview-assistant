@@ -42,6 +42,24 @@ os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
+
+def _env(name: str, default: str = "") -> str:
+    """Значение переменной без хвостовых CR/LF и пробелов (bat может передать \r при CRLF-файле)."""
+    return (os.environ.get(name) or default).strip().strip("\r\n")
+
+
+_CHILD_ENV_KEYS = ("CURSOR_API_KEY", "DEEPSEEK_API_KEY", "OPENROUTER_KEY", "INTERVIEW_DEEP_TOKEN", "GEMINI_API_KEY", "HTTP_PROXY", "HTTPS_PROXY")
+
+
+def _child_env() -> dict:
+    """Копия окружения с очищенными от CR/LF значениями ключей и прокси."""
+    env = dict(os.environ)
+    for k in _CHILD_ENV_KEYS:
+        if k in env:
+            env[k] = env[k].strip().strip("\r\n")
+    return env
+
+
 # --- Конфигурация ---
 SAMPLE_RATE = 16000
 VAD_FRAME_MS = 30
@@ -73,26 +91,26 @@ WHISPER_PROMPT = (
     "многомодульность, стартап-профиль, Baseline Profile"
 )
 QUICK_ENGINE = "gemini"
-DEEP_ENGINE = os.environ.get("DEEP_ENGINE", "gemini-deep")  # cursor | gemini-deep
-THIRD_ENGINE = os.environ.get("THIRD_ENGINE", "claude")  # claude | off
+DEEP_ENGINE = _env("DEEP_ENGINE", "gemini-deep")  # cursor | gemini-deep
+THIRD_ENGINE = _env("THIRD_ENGINE", "claude")  # claude | off
 
 # F9 режим: A=attach_next, B=retry, C=context-aware (дефолт), D=screen_only
-F9_MODE = os.environ.get("F9_MODE", "C").upper()
+F9_MODE = _env("F9_MODE", "C").upper()
 if F9_MODE not in {"A", "B", "C", "D"}:
     print(f"[f9] Неизвестный F9_MODE='{F9_MODE}', сброс в 'C'", flush=True)
     F9_MODE = "C"
 
 # Эндпоинт второго слота — задаётся через env (DEEP_ENDPOINT), встроенного дефолта нет
-DEEP_ENDPOINT = os.environ.get("DEEP_ENDPOINT", "")
+DEEP_ENDPOINT = _env("DEEP_ENDPOINT", "")
 # Токен только из окружения: встроенный дефолт не держим, без переменной VPS-режим
 # даёт явную ошибку (см. _vps_headers).
-INTERVIEW_DEEP_TOKEN = os.environ.get("INTERVIEW_DEEP_TOKEN", "")
+INTERVIEW_DEEP_TOKEN = _env("INTERVIEW_DEEP_TOKEN", "")
 
 CONTEXT_PATH = Path(__file__).parent / "context.md"
 # Оставляем CONTEXT_FILE как алиас для обратной совместимости (используется в VadWatcher/ControlHandler)
 CONTEXT_FILE = CONTEXT_PATH
 
-OPENROUTER_KEY = os.environ.get("OPENROUTER_KEY", "")
+OPENROUTER_KEY = _env("OPENROUTER_KEY", "")
 
 # --- Мультиплексор агентов ---
 # Клиент НЕ ищет харнессы, не замеряет их и не предлагает выбор.
@@ -285,6 +303,7 @@ def _run_agent_cmd(command: list[str], prompt: str, timeout: int) -> tuple[int, 
         encoding="utf-8",
         errors="replace",
         cwd=str(_ensure_agent_work_dir()),
+        env=_child_env(),
         **kwargs,
     )
     try:
@@ -358,7 +377,7 @@ def _ask_deepseek(
     """Прямой HTTP-запрос к api.deepseek.com. Текст ответа при успехе, иначе AgentCallError."""
     name = spec.get("name") or "deepseek"
     key_env = spec.get("api_key_env") or "DEEPSEEK_API_KEY"
-    api_key = spec.get("api_key") or os.environ.get(key_env, "")
+    api_key = (spec.get("api_key") or _env(key_env)).strip().strip("\r\n")
     if not api_key:
         raise AgentCallError(f"Ошибка {name}: не задан ключ (agents.json → api_key или env {key_env})")
 
@@ -496,7 +515,7 @@ else:
 FILTER_QUESTIONS = os.environ.get("TEST_FILTER_QUESTIONS", "0") == "1"
 
 # --- Ключ Gemini для локального is_interviewer_question ---
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_API_KEY = _env("GEMINI_API_KEY", "")
 
 # Уникальный ID сессии — для привязки серверных и клиентских логов
 SESSION_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
