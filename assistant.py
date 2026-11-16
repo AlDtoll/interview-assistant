@@ -64,10 +64,11 @@ def _child_env() -> dict:
 SAMPLE_RATE = 16000
 VAD_FRAME_MS = 30
 VAD_AGGRESSIVENESS = 1
-SILENCE_FRAMES_THRESHOLD = 33   # 33 x 30ms = ~1 сек тишины -> сегмент завершён
-MIN_SEGMENT_SECONDS = 2.0
-MAX_SEGMENT_SECONDS = 15.0      # force-close сегмент после N сек непрерывной речи (без паузы)
-RATE_LIMIT_SECONDS = 8
+SILENCE_FRAMES_THRESHOLD = 13   # 13 x 30ms = ~400 мс тишины -> сегмент завершён
+MIN_SEGMENT_SECONDS = 1.5
+MAX_SEGMENT_SECONDS = 8.0       # force-close сегмент после N сек непрерывной речи (без паузы)
+VAD_PREROLL_MS = 200            # сколько аудио до первого voiced-кадра сохраняем
+RATE_LIMIT_SECONDS = 6          # меньше MAX_SEGMENT_SECONDS: force-flush по длине не отбивается
 MANUAL_TRIGGER_SECONDS = 15     # сколько секунд аудио брать по Ctrl+Shift+S
 SCREEN_INTERVAL_SECONDS = 3
 SCREEN_RING_SIZE = 5
@@ -373,8 +374,11 @@ def _ask_cli(spec: dict, prompt: str, timeout: int, image_path: str | None = Non
 
 def _ask_deepseek(
     spec: dict, prompt: str, timeout: int, image_path: str | None = None,
+    on_delta=None, slot: str | None = None,
 ) -> str:
-    """Прямой HTTP-запрос к api.deepseek.com. Текст ответа при успехе, иначе AgentCallError."""
+    """Прямой HTTP-запрос к api.deepseek.com со стримингом (SSE).
+    Возвращает полный текст ответа; on_delta(accumulated) зовётся по мере поступления дельт.
+    slot — имя слота (quick/deep/third): от него зависит дефолтный лимит ответа."""
     name = spec.get("name") or "deepseek"
     key_env = spec.get("api_key_env") or "DEEPSEEK_API_KEY"
     api_key = (spec.get("api_key") or _env(key_env)).strip().strip("\r\n")
@@ -383,6 +387,25 @@ def _ask_deepseek(
 
     model = spec.get("model") or DEEPSEEK_DEFAULT_MODEL
     api_url = spec.get("api_url") or DEEPSEEK_API_URL
+    # Лимит ответа: явный max_tokens из agents.json применяется к любому слоту.
+    # Если он не задан — дефолт 140 токенов только для быстрого слота (quick);
+    # deep/third без явного лимита ограничение не отправляют, иначе глубокий
+    # ответ обрезается.
+    max_tokens: int | None = None
+    raw_max_tokens = spec.get("max_tokens")
+    if raw_max_tokens is not None:
+        try:
+            max_tokens = int(raw_max_tokens)
+        except (TypeError, ValueError):
+            print(f"[{name}] max_tokens={raw_max_tokens!r} не число — лимит не отправляем", flush=True)
+            max_tokens = None
+        else:
+            if max_tokens <= 0:
+                # 0 и отрицательные значения провайдер отбивает 400 — не отправляем.
+                print(f"[{name}] max_tokens={max_tokens} должен быть > 0 — лимит не отправляем", flush=True)
+                max_tokens = None
+    elif slot == "quick":
+        max_tokens = 140
     # Свежий скриншот уходит в формате OpenAI vision (data:image/jpeg;base64,...)
     if image_path and Path(image_path).exists():
         b64 = base64.b64encode(Path(image_path).read_bytes()).decode()
@@ -392,31 +415,98 @@ def _ask_deepseek(
         ]
     else:
         content = prompt
-    resp = httpx.post(
+
+    body: dict = {
+        "model": model,
+        "messages": [{"role": "user", "content": content}],
+        "stream": True,
+    }
+    if max_tokens is not None:
+        body["max_tokens"] = max_tokens
+    # Быстрый слот: у reasoning-моделей (например deepseek-flash) размышления
+    # съедают весь лимит и content приходит пустым — для quick их отключаем.
+    # Для собственного relay к DeepSeek автоопределение по домену не сработает —
+    # тогда thinking отключается явным полем thinking_disabled в spec слота.
+    if slot == "quick" and ("deepseek.com" in api_url or spec.get("thinking_disabled")):
+        body["thinking"] = {"type": "disabled"}
+
+    chunks: list[str] = []
+    finish_reason = None
+    # Общий дедлайн на весь стрим: read-таймаут httpx сбрасывается на каждом
+    # чанке, поэтому «сочащийся» поток иначе держал бы вызов бесконечно.
+    deadline = time.monotonic() + timeout
+    with httpx.stream(
+        "POST",
         api_url,
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        json={
-            "model": model,
-            "messages": [{"role": "user", "content": content}],
-            "stream": False,
-        },
+        json=body,
         timeout=timeout,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    try:
-        answer = data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError):
-        raise AgentCallError(f"Ошибка {name}: неожиданный формат ответа API")
-    answer = (answer or "").strip()
+    ) as resp:
+        resp.raise_for_status()
+        for line in resp.iter_lines():
+            if time.monotonic() > deadline:
+                raise AgentCallError(f"Ошибка {name}: timeout {timeout}s")
+            line = (line or "").strip()
+            if not line or line.startswith(":"):
+                continue
+            if line.startswith("data:"):
+                line = line[len("data:"):].strip()
+            if line == "[DONE]":
+                break
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            # Ошибка внутри SSE приходит отдельным payload — поднимаем её,
+            # иначе она превращалась бы в невнятный «пустой ответ».
+            if payload.get("error"):
+                err = payload["error"]
+                if isinstance(err, dict):
+                    msg = err.get("message") or err.get("type") or json.dumps(err, ensure_ascii=False)
+                else:
+                    msg = str(err)
+                raise AgentCallError(f"Ошибка {name}: {msg}")
+            try:
+                choice = payload["choices"][0]
+            except (KeyError, IndexError, TypeError):
+                continue
+            if not isinstance(choice, dict):
+                continue
+            # finish_reason читаем ДО delta: финальный чанк часто приходит без
+            # delta, и маркер «(обрезано)» иначе терялся.
+            fr = choice.get("finish_reason")
+            if fr:
+                finish_reason = fr
+            delta = None
+            raw_delta = choice.get("delta")
+            if isinstance(raw_delta, dict):
+                delta = raw_delta.get("content")
+            if not isinstance(delta, str) or not delta:
+                # Не-стриминговый ответ прокси: весь текст лежит в message.content.
+                message = choice.get("message")
+                if isinstance(message, dict):
+                    fallback = message.get("content")
+                    if isinstance(fallback, str) and fallback:
+                        delta = fallback
+            if delta:
+                chunks.append(delta)
+                if on_delta is not None:
+                    on_delta("".join(chunks))
+
+    answer = "".join(chunks).strip()
     if not answer:
         raise AgentCallError(f"Ошибка {name}: пустой ответ")
+    if finish_reason == "length":
+        print(f"[{name}] ответ обрезан по max_tokens (finish_reason=length)", flush=True)
+        answer += " …(обрезано)"
     return answer
 
 
 def ask_local(
     agent, system_prompt: str, question: str, timeout: int = 60,
-    image_path: str | None = None,
+    image_path: str | None = None, on_delta=None, slot: str | None = None,
 ) -> str:
     """
     Вызов указанного в agents.json агента. Возвращает текст ответа,
@@ -433,7 +523,7 @@ def ask_local(
     agent_type = str(spec.get("type") or "cli").lower()
     try:
         if agent_type == "deepseek":
-            return _ask_deepseek(spec, prompt, timeout, image_path=image_path)
+            return _ask_deepseek(spec, prompt, timeout, image_path=image_path, on_delta=on_delta, slot=slot)
         if agent_type == "cli":
             return _ask_cli(spec, prompt, timeout, image_path=image_path)
         raise AgentCallError(f"Ошибка {name}: неизвестный тип агента '{agent_type}'")
@@ -580,13 +670,13 @@ _INIT_CONTEXT = get_context()
 
 # --- Проектные заметки (RAG-lite по локальным .md/.txt) ---
 # Папка notes/ рядом с утилитой: рекурсивно читаем .md и .txt, режем на чанки,
-# строим TF-IDF на numpy и подмешиваем до 3 релевантных чанков в вопрос.
+# строим TF-IDF на numpy и подмешиваем до 2 релевантных чанков в вопрос.
 # Индекс строится лениво при первом вопросе; пересборка — при изменении mtime файлов.
 NOTES_DIR = Path(__file__).parent / "notes"
 NOTES_CHUNK_CHARS = 500
-NOTES_TOP_K = 3
+NOTES_TOP_K = 2
 NOTES_MIN_SCORE = 0.12
-NOTES_MAX_CHARS = 1800
+NOTES_MAX_CHARS = 900
 _NOTES_TOKEN_RE = re.compile(r"[а-яёa-z0-9_]{3,}")
 
 _notes_lock = threading.Lock()
@@ -1048,10 +1138,11 @@ def _ask_vps_slot(slot: str, transcript: str, screens: list[str], session_id: st
         raise AgentCallError(f"{type(e).__name__}: {_safe_error(e)}")
 
 
-def ask_slot(slot: str, transcript: str, screens: list[str], session_id: str) -> tuple[str, int]:
+def ask_slot(slot: str, transcript: str, screens: list[str], session_id: str, on_delta=None) -> tuple[str, int]:
     """
     Роутинг слота overlay: vps | local | local_fallback_vps.
     Возвращает (answer, latency_ms). Ошибка вызова — AgentCallError.
+    on_delta — необязательный колбэк для стриминга локального deepseek-агента.
     """
     mode = _agent_mode()
     agent = _slot_agents().get(slot)
@@ -1093,6 +1184,8 @@ def ask_slot(slot: str, transcript: str, screens: list[str], session_id: str) ->
                 image_filename=Path(image_path).name if image_path else "",
             ),
             image_path=image_path,
+            on_delta=on_delta,
+            slot=slot,
         )
     except AgentCallError as e:
         if mode == "local_fallback_vps":
@@ -1205,9 +1298,11 @@ def _log_exchange(
     whisper_latency_ms: int | None = None,
     third: str | None = None,
     third_ms: int | None = None,
+    end_to_first_ms: int | None = None,
 ) -> None:
     """Пишет одну строку JSONL в клиентский лог сессии.
-    Принимает None для незавершённых тиров — пишем сразу по факту готовности любого."""
+    Принимает None для незавершённых тиров — пишем сразу по факту готовности любого.
+    end_to_first_ms — от завершения сегмента VAD до первого текста быстрого слота."""
     record = {
         "ts": datetime.utcnow().isoformat() + "Z",
         "transcript": transcript,
@@ -1218,6 +1313,7 @@ def _log_exchange(
         "deep_latency_ms": deep_ms,
         "third_latency_ms": third_ms,
         "whisper_latency_ms": whisper_latency_ms,
+        "end_to_first_ms": end_to_first_ms,
     }
     try:
         with CLIENT_LOG.open("a", encoding="utf-8") as f:
@@ -1231,15 +1327,18 @@ _quick_in_flight = False
 _quick_in_flight_lock = threading.Lock()
 
 
-def ask_dual(transcript: str, screens: list[str], session_id: str, whisper_latency_ms: int | None = None) -> None:
+def ask_dual(transcript: str, screens: list[str], session_id: str, whisper_latency_ms: int | None = None,
+             segment_end_ts: float | None = None) -> None:
     """
     Запускает два параллельных запроса (первый и второй слоты), каждый обновляет свой overlay.
     Блокироваться не нужно — оба потока daemon, результаты через after(0, ...).
     Первый слот пропускается (skip), если предыдущий запрос ещё не завершился — защита от throttling.
     Лог пишется раздельно: каждый тир пишет свою JSONL-запись сразу по завершении (null для другого).
     whisper_latency_ms — время транскрипции Whisper, пишется только в quick-запись.
+    segment_end_ts — time.monotonic() момента завершения VAD-сегмента (для метрики end_to_first_ms).
     """
     global _quick_in_flight
+    seg_end = segment_end_ts if segment_end_ts is not None else time.monotonic()
 
     # LLM-фильтр: пропускаем ответы кандидата в тест-режиме (TEST_FILTER_QUESTIONS=1)
     if FILTER_QUESTIONS and not is_interviewer_question(transcript):
@@ -1249,6 +1348,19 @@ def ask_dual(transcript: str, screens: list[str], session_id: str, whisper_laten
 
     def _quick_thread():
         global _quick_in_flight
+        # Метрика: момент первого текста быстрого слота относительно конца сегмента
+        first_text_ms: list[int | None] = [None]
+        _stream_last = [0.0]
+
+        def _on_delta(acc: str) -> None:
+            now = time.monotonic()
+            if first_text_ms[0] is None and acc.strip():
+                first_text_ms[0] = int((now - seg_end) * 1000)
+            # Троттлинг UI-обновлений: не чаще ~12 раз в секунду
+            if now - _stream_last[0] >= 0.08:
+                _stream_last[0] = now
+                overlay.set_quick_stream_safe(acc)
+
         with _quick_in_flight_lock:
             if _quick_in_flight:
                 print("[quick] skipped: предыдущий запрос ещё в процессе")
@@ -1256,14 +1368,20 @@ def ask_dual(transcript: str, screens: list[str], session_id: str, whisper_laten
                 return
             _quick_in_flight = True
         try:
-            answer, quick_ms = ask_slot("quick", transcript, screens, session_id)
+            answer, quick_ms = ask_slot("quick", transcript, screens, session_id, on_delta=_on_delta)
             overlay.append_quick_qa_safe(transcript, answer, quick_ms)
             overlay.set_quick_status_safe(f"Ответ ({quick_ms}ms)")
+            # Без стриминга (CLI) дельт нет — метрика остаётся None, а не равна quick_ms
+            end_to_first_ms = first_text_ms[0]
             # Пишем запись только для quick — deep ещё может быть в процессе
             # whisper_latency_ms пишем в quick-запись (transcript первичен здесь)
-            _log_exchange(transcript, answer, None, quick_ms, None, whisper_latency_ms=whisper_latency_ms)
+            _log_exchange(transcript, answer, None, quick_ms, None, whisper_latency_ms=whisper_latency_ms,
+                          end_to_first_ms=end_to_first_ms)
         except Exception as e:
             print(f"[quick] error: {type(e).__name__}: {str(e)[:200]}", flush=True)
+            # Очищаем живой блок стриминга, иначе недописанный текст выглядит
+            # как готовый ответ рядом с сообщением об ошибке.
+            overlay.clear_quick_stream_safe()
             overlay.set_quick_status_safe(f"Ошибка: {_safe_error(e)}")
         finally:
             with _quick_in_flight_lock:
@@ -1443,6 +1561,10 @@ class VadWatcher:
         self._buf = b""
         self._segment: list[np.ndarray] = []
         self._silence_count = 0
+        # Pre-roll: последние VAD_PREROLL_MS тихих кадров, чтобы не срезать начало слова
+        # (округляем вверх: 200 мс / 30 мс = 7 кадров, а не 6 — иначе теряем ~20 мс)
+        _preroll_frames = max(1, -(-VAD_PREROLL_MS // VAD_FRAME_MS))
+        self._preroll: deque = deque(maxlen=_preroll_frames)
         self._last_sent = 0.0
         self._rate_lock = threading.Lock()
         # Счётчики для debug-вывода каждые 3 сек
@@ -1472,6 +1594,10 @@ class VadWatcher:
             frame_np = np.frombuffer(frame, dtype=np.int16)
 
             if is_speech:
+                # Перед первым voiced-кадром добираем pre-roll из последних тихих кадров
+                if not self._segment and self._preroll:
+                    self._segment.extend(self._preroll)
+                    self._preroll.clear()
                 self._segment.append(frame_np)
                 self._silence_count = 0
                 # Force-flush по максимальной длине — не ждать паузы от интервьюера
@@ -1483,6 +1609,9 @@ class VadWatcher:
                     self._silence_count += 1
                     if self._silence_count <= 10:
                         self._segment.append(frame_np)
+                else:
+                    # Тишина до начала речи — держим только короткий pre-roll
+                    self._preroll.append(frame_np)
 
                 if self._silence_count >= SILENCE_FRAMES_THRESHOLD and self._segment:
                     self._flush_segment()
@@ -1506,6 +1635,7 @@ class VadWatcher:
         segment_audio = np.concatenate(self._segment)
         self._segment = []
         self._silence_count = 0
+        self._preroll.clear()
 
         duration = len(segment_audio) / SAMPLE_RATE
         duration_ms = int(duration * 1000)
@@ -1514,11 +1644,16 @@ class VadWatcher:
             return
 
         now = time.time()
-        with self._rate_lock:
-            if now - self._last_sent < RATE_LIMIT_SECONDS:
-                print(f"[VAD] segment closed ({reason}): {duration_ms}ms, rate-limited, skipped")
-                return
-            self._last_sent = now
+        # Force-flush по длине (reason == "max duration") не трогает rate-limit:
+        # иначе длинная непрерывная речь теряется, а её хвост после разрыва
+        # (например, 2 с из 10) отбивался бы rate-limit'ом. _last_sent остаётся
+        # от предыдущей реальной отправки.
+        if reason != "max duration":
+            with self._rate_lock:
+                if now - self._last_sent < RATE_LIMIT_SECONDS:
+                    print(f"[VAD] segment closed ({reason}): {duration_ms}ms, rate-limited, skipped")
+                    return
+                self._last_sent = now
 
         print(f"[VAD] segment closed ({reason}): {duration_ms}ms, forwarding to Whisper")
         overlay.set_quick_status_safe("Слушаю...")
@@ -1875,6 +2010,9 @@ def _is_junk_transcript(text: str) -> bool:
 
 def on_segment(audio: np.ndarray):
     """Вызывается из VAD watcher в отдельном потоке."""
+    # Момент завершения VAD-сегмента — база для метрики end_to_first_ms
+    segment_end_ts = time.monotonic()
+
     def run():
         if whisper_model is None:
             overlay.set_quick_status_safe("Whisper ещё загружается...")
@@ -1893,7 +2031,7 @@ def on_segment(audio: np.ndarray):
         segments, _ = whisper_model.transcribe(
             audio_float,
             language="ru",
-            beam_size=5,
+            beam_size=1,
             initial_prompt=WHISPER_PROMPT,
             condition_on_previous_text=False,
             temperature=0,
@@ -1937,7 +2075,8 @@ def on_segment(audio: np.ndarray):
         with _state_lock:
             last_transcript = transcript
 
-        # Логика screens: sticky > pending > последний кадр из кольца (по умолчанию)
+        # Логика screens: по умолчанию скриншот НЕ прикладываем (быстрее запрос);
+        # кадр добавляют только sticky (F8) или pending (F9 mode A).
         with _state_lock:
             if sticky_mode:
                 screens = screen_ring.get_recent(count=1)
@@ -1945,9 +2084,7 @@ def on_segment(audio: np.ndarray):
                 screens = list(pending_screen)
                 pending_screen.clear()
             else:
-                # По умолчанию отдаём самый свежий кадр (обновляется каждые SCREEN_INTERVAL_SECONDS);
-                # если кольцо пустое — get_recent вернёт [], промпт скажет «не передан»
-                screens = screen_ring.get_recent(count=1)
+                screens = []
 
         if screens:
             latest_path = Path(__file__).parent / "latest_screen.jpg"
@@ -1958,7 +2095,8 @@ def on_segment(audio: np.ndarray):
 
         overlay.show_safe()
 
-        ask_dual(transcript, screens, SESSION_ID, whisper_latency_ms=whisper_latency_ms)
+        ask_dual(transcript, screens, SESSION_ID, whisper_latency_ms=whisper_latency_ms,
+                 segment_end_ts=segment_end_ts)
 
     threading.Thread(target=run, daemon=True).start()
 
@@ -2198,6 +2336,10 @@ class DualOverlay:
         self._visible = True
         self._drag_start_x = 0
         self._drag_start_y = 0
+        # Позиция живого блока стриминга в тексте первого слота (None — блока нет)
+        self._quick_stream_index = None
+        # Позиция текста стрима (сразу после строки заголовка)
+        self._quick_stream_body_index = None
 
     def _on_drag_start(self, event):
         self._drag_start_x = event.x
@@ -2221,7 +2363,34 @@ class DualOverlay:
             text=f"{_slot_label('deep', 'Gemini Flash')}  |  {text}"
         )
 
+    # Заголовок живого блока стриминга в панели первого слота
+    _QUICK_STREAM_HEADER = "\n── поток ──\n"
+
+    def _set_quick_stream_inner(self, text: str) -> None:
+        """Живой предпросмотр стриминга в тексте панели первого слота."""
+        if self._quick_stream_index is None:
+            # Индекс начала блока запоминаем ДО вставки заголовка: очистка
+            # должна удалять и заголовок, и текст стрима, а не оставлять хвост.
+            self._quick_stream_index = self._quick_body.index("end-1c")
+            self._quick_body.insert("end", self._QUICK_STREAM_HEADER)
+            # Начало текста берём ПОСЛЕ вставки заголовка: арифметика
+            # «индекс + len(header)» промахивалась на один символ, и текст
+            # рисовался в одной строке с «── поток ──».
+            self._quick_stream_body_index = self._quick_body.index("end-1c")
+        body_start = self._quick_stream_body_index
+        self._quick_body.delete(body_start, "end-1c")
+        self._quick_body.insert(body_start, text)
+        self._quick_body.see("end")
+
+    def _clear_quick_stream_inner(self) -> None:
+        """Убирает живой блок стриминга вместе с заголовком."""
+        if self._quick_stream_index is not None:
+            self._quick_body.delete(self._quick_stream_index, "end-1c")
+            self._quick_stream_index = None
+            self._quick_stream_body_index = None
+
     def _append_quick_qa_inner(self, transcript: str, answer: str, latency_ms=None) -> None:
+        self._clear_quick_stream_inner()
         from datetime import datetime
         ts = datetime.now().strftime("%H:%M:%S")
         lat_str = f" ({latency_ms}ms)" if latency_ms else ""
@@ -2266,6 +2435,12 @@ class DualOverlay:
 
     def set_quick_status_safe(self, text: str) -> None:
         self.root.after(0, lambda: self.set_quick_status(text))
+
+    def set_quick_stream_safe(self, text: str) -> None:
+        self.root.after(0, lambda: self._set_quick_stream_inner(text))
+
+    def clear_quick_stream_safe(self) -> None:
+        self.root.after(0, self._clear_quick_stream_inner)
 
     def set_deep_status_safe(self, text: str) -> None:
         self.root.after(0, lambda: self.set_deep_status(text))
@@ -2386,6 +2561,10 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
             def _clear():
                 overlay._quick_body.delete("1.0", "end")
                 overlay._deep_body.delete("1.0", "end")
+                # Сбрасываем индекс живого блока: текстовое поле очищено,
+                # старый индекс указывает в пустоту.
+                overlay._quick_stream_index = None
+                overlay._quick_stream_body_index = None
             overlay.root.after(0, _clear)
             self._json(200, {"status": "cleared"})
         elif path == "/invalidate_context":
